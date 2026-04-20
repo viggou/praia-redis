@@ -1,0 +1,233 @@
+// grains/redis.praia — Redis client grain for Praia
+//
+// Implements the RESP (REdis Serialization Protocol) using raw TCP sockets.
+// Provides a simple client API for common Redis operations.
+//
+// Usage:
+//   use "redis"
+//   let r = redis.connect({host: "localhost", port: 6379, password: "secret"})
+//   r.set("name", "Ada")
+//   let name = r.get("name")
+//   r.del("name")
+//   r.close()
+
+// ============================================================
+// Helpers
+// ============================================================
+
+func hasKey(m, k) {
+    return keys(m).contains(k)
+}
+
+func recvExact(sock, n) {
+    let result = ""
+    while (len(result) < n) {
+        let chunk = net.recv(sock, n - len(result))
+        if (len(chunk) == 0) {
+            throw "Redis: connection closed unexpectedly"
+        }
+        result = result + chunk
+    }
+    return result
+}
+
+func readLine(sock) {
+    let result = ""
+    while (true) {
+        let ch = recvExact(sock, 1)
+        if (ch == "\r") {
+            let lf = recvExact(sock, 1)
+            return result
+        }
+        result = result + ch
+    }
+}
+
+// ============================================================
+// RESP Protocol
+// ============================================================
+
+func sendCommand(sock, args) {
+    let msg = "*" + str(len(args)) + "\r\n"
+    for (arg in args) {
+        let s = str(arg)
+        msg = msg + "$" + str(len(s)) + "\r\n" + s + "\r\n"
+    }
+    net.send(sock, msg)
+}
+
+func readResponse(sock) {
+    let line = readLine(sock)
+    let prefix = line[0]
+    let body = ""
+    for (i in 1..len(line)) {
+        body = body + line[i]
+    }
+
+    if (prefix == "+") {
+        return body
+    }
+
+    if (prefix == "-") {
+        throw "Redis: " + body
+    }
+
+    if (prefix == ":") {
+        return num(body)
+    }
+
+    if (prefix == "$") {
+        let length = num(body)
+        if (length == -1) {
+            return nil
+        }
+        let data = recvExact(sock, length)
+        recvExact(sock, 2) // trailing \r\n
+        return data
+    }
+
+    if (prefix == "*") {
+        let count = num(body)
+        if (count == -1) {
+            return nil
+        }
+        let items = []
+        for (i in 0..count) {
+            items.push(readResponse(sock))
+        }
+        return items
+    }
+
+    throw "Redis: unknown response type: " + prefix
+}
+
+// ============================================================
+// Client
+// ============================================================
+
+func connect(config) {
+    let host = "localhost"
+    if (hasKey(config, "host")) { host = config.host }
+    let port = 6379
+    if (hasKey(config, "port")) { port = config.port }
+
+    let sock = net.connect(host, port)
+
+    // Authenticate if password provided
+    if (hasKey(config, "password")) {
+        if (hasKey(config, "username")) {
+            sendCommand(sock, ["AUTH", config.username, config.password])
+        } else {
+            sendCommand(sock, ["AUTH", config.password])
+        }
+        readResponse(sock)
+    }
+
+    // Select database if specified
+    if (hasKey(config, "db")) {
+        sendCommand(sock, ["SELECT", str(config.db)])
+        readResponse(sock)
+    }
+
+    let closed = false
+
+    func cmd(args) {
+        if (closed) { throw "Redis: connection is closed" }
+        sendCommand(sock, args)
+        return readResponse(sock)
+    }
+
+    return {
+        // Strings
+        get: lam{ key in return cmd(["GET", key]) },
+        set: lam{ key, value in return cmd(["SET", key, str(value)]) },
+        setnx: lam{ key, value in return cmd(["SETNX", key, str(value)]) },
+        getset: lam{ key, value in return cmd(["GETSET", key, str(value)]) },
+        mget: lam{ keys in return cmd(["MGET"] + keys) },
+        incr: lam{ key in return cmd(["INCR", key]) },
+        incrby: lam{ key, amount in return cmd(["INCRBY", key, str(amount)]) },
+        decr: lam{ key in return cmd(["DECR", key]) },
+        decrby: lam{ key, amount in return cmd(["DECRBY", key, str(amount)]) },
+        append: lam{ key, value in return cmd(["APPEND", key, str(value)]) },
+
+        // Keys
+        del: lam{ key in return cmd(["DEL", key]) },
+        exists: lam{ key in return cmd(["EXISTS", key]) },
+        expire: lam{ key, seconds in return cmd(["EXPIRE", key, str(seconds)]) },
+        ttl: lam{ key in return cmd(["TTL", key]) },
+        persist: lam{ key in return cmd(["PERSIST", key]) },
+        keys: lam{ pattern in return cmd(["KEYS", pattern]) },
+        rename: lam{ key, newkey in return cmd(["RENAME", key, newkey]) },
+        type: lam{ key in return cmd(["TYPE", key]) },
+
+        // Lists
+        lpush: lam{ key, value in return cmd(["LPUSH", key, str(value)]) },
+        rpush: lam{ key, value in return cmd(["RPUSH", key, str(value)]) },
+        lpop: lam{ key in return cmd(["LPOP", key]) },
+        rpop: lam{ key in return cmd(["RPOP", key]) },
+        llen: lam{ key in return cmd(["LLEN", key]) },
+        lrange: lam{ key, start, stop in return cmd(["LRANGE", key, str(start), str(stop)]) },
+        lindex: lam{ key, index in return cmd(["LINDEX", key, str(index)]) },
+
+        // Sets
+        sadd: lam{ key, member in return cmd(["SADD", key, str(member)]) },
+        srem: lam{ key, member in return cmd(["SREM", key, str(member)]) },
+        smembers: lam{ key in return cmd(["SMEMBERS", key]) },
+        sismember: lam{ key, member in return cmd(["SISMEMBER", key, str(member)]) },
+        scard: lam{ key in return cmd(["SCARD", key]) },
+
+        // Hashes
+        hset: lam{ key, field, value in return cmd(["HSET", key, field, str(value)]) },
+        hget: lam{ key, field in return cmd(["HGET", key, field]) },
+        hdel: lam{ key, field in return cmd(["HDEL", key, field]) },
+        hgetall: lam{ key in
+            let flat = cmd(["HGETALL", key])
+            let result = {}
+            for (i in 0..len(flat)) {
+                if (i % 2 == 0) {
+                    result[flat[i]] = flat[i + 1]
+                }
+            }
+            return result
+        },
+        hexists: lam{ key, field in return cmd(["HEXISTS", key, field]) },
+        hkeys: lam{ key in return cmd(["HKEYS", key]) },
+        hvals: lam{ key in return cmd(["HVALS", key]) },
+        hlen: lam{ key in return cmd(["HLEN", key]) },
+
+        // Sorted Sets
+        zadd: lam{ key, score, member in return cmd(["ZADD", key, str(score), str(member)]) },
+        zrem: lam{ key, member in return cmd(["ZREM", key, str(member)]) },
+        zscore: lam{ key, member in return cmd(["ZSCORE", key, str(member)]) },
+        zrank: lam{ key, member in return cmd(["ZRANK", key, str(member)]) },
+        zrange: lam{ key, start, stop in return cmd(["ZRANGE", key, str(start), str(stop)]) },
+        zcard: lam{ key in return cmd(["ZCARD", key]) },
+
+        // Pub/Sub
+        publish: lam{ channel, message in return cmd(["PUBLISH", channel, str(message)]) },
+
+        // Server
+        ping: lam{ in return cmd(["PING"]) },
+        echo: lam{ message in return cmd(["ECHO", str(message)]) },
+        info: lam{ in return cmd(["INFO"]) },
+        dbsize: lam{ in return cmd(["DBSIZE"]) },
+        flushdb: lam{ in return cmd(["FLUSHDB"]) },
+        flushall: lam{ in return cmd(["FLUSHALL"]) },
+
+        // Raw command for anything not covered above
+        raw: lam{ args in return cmd(args) },
+
+        // Connection
+        close: lam{ in
+            if (!closed) {
+                try {
+                    sendCommand(sock, ["QUIT"])
+                } catch (e) {}
+                net.close(sock)
+                closed = true
+            }
+        }
+    }
+}
+
+export { connect }
