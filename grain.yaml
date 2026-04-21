@@ -3,5 +3,5 @@ version: 0.1.0
 description: A redis client for Praia
 author: Viggo Lekdorf
 license: MIT
-main: redis.praia
+main: main.praia
 dependencies:
