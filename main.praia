@@ -15,10 +15,6 @@
 // Helpers
 // ============================================================
 
-func hasKey(m, k) {
-    return keys(m).contains(k)
-}
-
 func recvExact(sock, n) {
     let result = ""
     while (len(result) < n) {
@@ -36,7 +32,7 @@ func readLine(sock) {
     while (true) {
         let ch = recvExact(sock, 1)
         if (ch == "\r") {
-            let lf = recvExact(sock, 1)
+            recvExact(sock, 1)
             return result
         }
         result = result + ch
@@ -59,28 +55,15 @@ func sendCommand(sock, args) {
 func readResponse(sock) {
     let line = readLine(sock)
     let prefix = line[0]
-    let body = ""
-    for (i in 1..len(line)) {
-        body = body + line[i]
-    }
+    let body = line.slice(1)
 
-    if (prefix == "+") {
-        return body
-    }
-
-    if (prefix == "-") {
-        throw "Redis: " + body
-    }
-
-    if (prefix == ":") {
-        return num(body)
-    }
+    if (prefix == "+") { return body }
+    if (prefix == "-") { throw "Redis: " + body }
+    if (prefix == ":") { return num(body) }
 
     if (prefix == "$") {
         let length = num(body)
-        if (length == -1) {
-            return nil
-        }
+        if (length == -1) { return nil }
         let data = recvExact(sock, length)
         recvExact(sock, 2) // trailing \r\n
         return data
@@ -88,9 +71,7 @@ func readResponse(sock) {
 
     if (prefix == "*") {
         let count = num(body)
-        if (count == -1) {
-            return nil
-        }
+        if (count == -1) { return nil }
         let items = []
         for (i in 0..count) {
             items.push(readResponse(sock))
@@ -106,16 +87,14 @@ func readResponse(sock) {
 // ============================================================
 
 func connect(config) {
-    let host = "localhost"
-    if (hasKey(config, "host")) { host = config.host }
-    let port = 6379
-    if (hasKey(config, "port")) { port = config.port }
+    let host = config.get("host", "localhost")
+    let port = config.get("port", 6379)
 
     let sock = net.connect(host, port)
 
     // Authenticate if password provided
-    if (hasKey(config, "password")) {
-        if (hasKey(config, "username")) {
+    if (config.has("password")) {
+        if (config.has("username")) {
             sendCommand(sock, ["AUTH", config.username, config.password])
         } else {
             sendCommand(sock, ["AUTH", config.password])
@@ -124,7 +103,7 @@ func connect(config) {
     }
 
     // Select database if specified
-    if (hasKey(config, "db")) {
+    if (config.has("db")) {
         sendCommand(sock, ["SELECT", str(config.db)])
         readResponse(sock)
     }
